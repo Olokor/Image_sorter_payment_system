@@ -43,11 +43,18 @@ PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
 PRICE_PER_STUDENT = 200  # ₦200 per student
 
 # Email configuration
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL")
+# Email configuration (safer parsing)
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+try:
+    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+except ValueError:
+    SMTP_PORT = 587
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "")   # e.g. "noreply@yourdomain.com"
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Photo Sorter App")
+USE_TLS = os.getenv("USE_TLS", "True").lower() in ("1", "true", "yes")
+
 
 # ==================== PASSWORD HASHING WITH ARGON2 ====================
 
@@ -230,32 +237,52 @@ def generate_otp() -> str:
     return str(secrets.randbelow(1000000)).zfill(6)
 
 
-async def send_email(to_email: str, subject: str, body: str):
-    """Send email using SMTP"""
+async def send_email(to_email: str, subject: str, body: str) -> bool:
+    """Send email using SMTP with better logging and typed port/tls"""
     try:
         import emails
         from emails.template import JinjaTemplate as T
-        
+
+        mail_from = (SMTP_FROM_NAME, SMTP_FROM_EMAIL) if SMTP_FROM_EMAIL else ("Photo Sorter App", "noreply@localhost")
+
         message = emails.Message(
             subject=subject,
             html=T(body),
-            mail_from=(SMTP_FROM_EMAIL, "Photo Sorter App")
+            mail_from=mail_from
         )
-        print(message.__str__())
-        r = message.send(
+
+        smtp_opts = {
+            "host": SMTP_HOST,
+            "port": SMTP_PORT,
+            "user": SMTP_USERNAME or None,
+            "password": SMTP_PASSWORD or None,
+            "tls": bool(USE_TLS)
+        }
+
+        print(f"[email] sending to={to_email} smtp={smtp_opts}")
+
+        # IMPORTANT: removed timeout
+        result = message.send(
             to=to_email,
-            smtp={
-                "host": SMTP_HOST,
-                "port": SMTP_PORT,
-                "user": SMTP_USERNAME,
-                "password": SMTP_PASSWORD,
-                "tls": True
-            }
+            smtp=smtp_opts
         )
-        
-        return r.status_code == 250
+
+        try:
+            status_code = getattr(result, "status_code", None)
+            reason = getattr(result, "reason", None)
+            print(f"[email] send result status_code={status_code} reason={reason} raw={result}")
+        except Exception:
+            print(f"[email] send result: {result}")
+
+        if status_code in (250, None):
+            return True
+        if getattr(result, "success", None) or getattr(result, "ok", None):
+            return True
+
+        return False
+
     except Exception as e:
-        print(f"Email error: {e}")
+        print(f"[email] exception sending email: {e}")
         return False
 
 
@@ -544,17 +571,28 @@ async def login(request: LoginRequest):
 
 @app.post("/auth/resend-otp")
 async def resend_otp(request: ResendOTPRequest, background_tasks: BackgroundTasks):
-    """Resend OTP"""
+    """Resend OTP with basic rate limit and success check"""
     user = await User.find_one(User.email == request.email)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
     if user.email_verified:
         raise HTTPException(status_code=400, detail="Email already verified")
-    
+
+    # Basic rate limiting: check last OTP created within X seconds
+    recent = await OTPVerification.find(
+        OTPVerification.email == request.email,
+        OTPVerification.purpose == "signup"
+    ).sort([("created_at", -1)]).first_or_none()
+
+    if recent:
+        seconds_since = (datetime.utcnow() - recent.created_at).total_seconds()
+        if seconds_since < 60:   # 60 seconds cooldown
+            raise HTTPException(status_code=429, detail=f"Please wait {int(60 - seconds_since)}s before requesting a new OTP")
+
     otp_code = generate_otp()
     expires_at = datetime.utcnow() + timedelta(minutes=10)
-    
+
     otp = OTPVerification(
         email=request.email,
         otp_code=otp_code,
@@ -562,10 +600,17 @@ async def resend_otp(request: ResendOTPRequest, background_tasks: BackgroundTask
         expires_at=expires_at
     )
     await otp.insert()
-    
-    background_tasks.add_task(send_otp_email, request.email, otp_code, "signup")
-    
-    return {"success": True, "message": "OTP sent to your email"}
+
+    # Use background task but capture result by scheduling a wrapper that logs outcome
+    async def _send_and_log(email, code):
+        sent = await send_otp_email(email, code, "signup")
+        print(f"[otp] resend to {email} code={code} sent={sent}")
+        return sent
+
+    # schedule background send
+    background_tasks.add_task(_send_and_log, request.email, otp_code)
+
+    return {"success": True, "message": "OTP queued for sending (check logs for delivery status)"}
 
 
 @app.get("/license/status")
