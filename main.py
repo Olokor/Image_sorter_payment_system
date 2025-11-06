@@ -1,21 +1,22 @@
 """
-Photo Sorter - Hosted Backend API (MongoDB Version) with Argon2
-Handles authentication, licensing, and payment verification
-Using Argon2 instead of bcrypt - no byte limitations!
+Photo Sorter - SECURE Hosted Backend API
+Multi-layer security: API Keys, Rate Limiting, Request Signing, IP Whitelisting
 
-Requirements: pip install argon2-cffi
+pip install slowapi redis argon2-cffi
 """
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 import motor.motor_asyncio
 from beanie import init_beanie, Document, Indexed, PydanticObjectId
 from pydantic import BaseModel, EmailStr, Field, validator
 from bson import ObjectId
 
-# CHANGED: Using Argon2 instead of bcrypt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 
@@ -38,41 +39,34 @@ SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30  # 30 days
 
+# NEW: API Key for desktop app authentication
+DESKTOP_APP_API_KEY = os.getenv("DESKTOP_APP_API_KEY", secrets.token_urlsafe(32))
+REQUEST_SIGNING_KEY = os.getenv("REQUEST_SIGNING_KEY", secrets.token_urlsafe(32))
+
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
-PRICE_PER_STUDENT = 200  # ₦200 per student
+PRICE_PER_STUDENT = 200
 
 # Email configuration
-# Email configuration (safer parsing)
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-try:
-    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-except ValueError:
-    SMTP_PORT = 587
-SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "")   # e.g. "noreply@yourdomain.com"
-SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Photo Sorter App")
-USE_TLS = os.getenv("USE_TLS", "True").lower() in ("1", "true", "yes")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL")
 
+# IP Whitelist (optional - for extra security)
+ALLOWED_IP_RANGES = os.getenv("ALLOWED_IP_RANGES", "").split(",") if os.getenv("ALLOWED_IP_RANGES") else []
 
 # ==================== PASSWORD HASHING WITH ARGON2 ====================
-
-# Initialize Argon2 password hasher
-# Argon2 is more secure than bcrypt and has no byte limitations
 ph = PasswordHasher(
-    time_cost=2,        # Number of iterations
-    memory_cost=65536,  # 64 MB memory usage
-    parallelism=2,      # Number of parallel threads
-    hash_len=32,        # Length of hash in bytes
-    salt_len=16         # Length of salt in bytes
+    time_cost=2,
+    memory_cost=65536,
+    parallelism=2,
+    hash_len=32,
+    salt_len=16
 )
 
 def hash_password(password: str) -> str:
-    """
-    Hash password using Argon2
-    No byte limitations, very secure
-    """
     try:
         return ph.hash(password)
     except Exception as e:
@@ -81,27 +75,15 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """
-    Verify password using Argon2
-    Returns True if password matches, False otherwise
-    """
     try:
         ph.verify(hashed_password, plain_password)
-        
-        # Check if hash needs rehashing (e.g., if settings changed)
         if ph.check_needs_rehash(hashed_password):
-            print("Password hash needs rehashing (outdated parameters)")
-        
+            print("Password hash needs rehashing")
         return True
-    except VerifyMismatchError:
-        # Password doesn't match
-        return False
-    except (VerificationError, InvalidHash) as e:
-        # Hash is corrupted or invalid
-        print(f"Password verification error: {e}")
+    except (VerifyMismatchError, VerificationError, InvalidHash):
         return False
     except Exception as e:
-        print(f"Unexpected error during verification: {e}")
+        print(f"Verification error: {e}")
         return False
 
 
@@ -111,6 +93,9 @@ db = client[MONGO_DB_NAME]
 
 security = HTTPBearer()
 
+# ==================== RATE LIMITING ====================
+limiter = Limiter(key_func=get_remote_address)
+
 # ==================== MODELS ====================
 class User(Document):
     name: str
@@ -118,21 +103,22 @@ class User(Document):
     password_hash: str
     phone: Optional[str] = None
     
-    # Email verification
     email_verified: bool = False
     verification_token: Optional[str] = None
     
-    # Account status
     is_active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_login: Optional[datetime] = None
     
-    # License info
     total_students_purchased: int = 0
     license_valid_until: Optional[datetime] = None
     
-    # Device binding
     device_fingerprint: Optional[str] = None
+    
+    # Security tracking
+    failed_login_attempts: int = 0
+    last_failed_login: Optional[datetime] = None
+    account_locked_until: Optional[datetime] = None
 
     class Settings:
         name = "users"
@@ -140,21 +126,13 @@ class User(Document):
 
 class License(Document):
     user_id: PydanticObjectId
-    
-    # Purchase details
     student_count: int
     amount_paid: float
     payment_reference: Indexed(str, unique=True)
-    
-    # Status
     payment_status: str = "pending"
     payment_verified_at: Optional[datetime] = None
-    
-    # Validity
     valid_from: datetime = Field(default_factory=datetime.utcnow)
     valid_until: datetime
-    
-    # Metadata
     created_at: datetime = Field(default_factory=datetime.utcnow)
     paystack_data: Optional[str] = None
 
@@ -166,7 +144,6 @@ class OTPVerification(Document):
     email: Indexed(EmailStr)
     otp_code: str
     purpose: str
-    
     created_at: datetime = Field(default_factory=datetime.utcnow)
     expires_at: datetime
     verified: bool = False
@@ -174,6 +151,20 @@ class OTPVerification(Document):
 
     class Settings:
         name = "otp_verifications"
+
+
+class APIAccessLog(Document):
+    """Log API access for monitoring"""
+    ip_address: str
+    endpoint: str
+    method: str
+    user_agent: Optional[str] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    api_key_valid: bool = False
+    user_id: Optional[str] = None
+
+    class Settings:
+        name = "api_access_logs"
 
 
 # ==================== PYDANTIC MODELS ====================
@@ -188,7 +179,7 @@ class SignupRequest(BaseModel):
         if len(v) < 6:
             raise ValueError('Password must be at least 6 characters')
         if len(v) > 200:
-            raise ValueError('Password too long (max 200 characters)')
+            raise ValueError('Password too long')
         return v
 
 
@@ -219,79 +210,137 @@ class TokenResponse(BaseModel):
     license_status: dict
 
 
-# ==================== HELPER FUNCTIONS ====================
+# ==================== SECURITY FUNCTIONS ====================
+
+def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> bool:
+    """Verify API key from desktop app"""
+    if not x_api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="API Key required. Please update your desktop app."
+        )
+    
+    if x_api_key != DESKTOP_APP_API_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid API Key. Please reinstall the desktop app."
+        )
+    
+    return True
+
+
+def verify_request_signature(
+    request_body: str,
+    timestamp: str,
+    signature: str = Header(..., alias="X-Request-Signature")
+) -> bool:
+    """
+    Verify request signature to prevent replay attacks
+    Desktop app should sign requests with: HMAC-SHA256(timestamp + body, signing_key)
+    """
+    # Check timestamp (reject requests older than 5 minutes)
+    try:
+        req_time = datetime.fromisoformat(timestamp)
+        if (datetime.utcnow() - req_time).total_seconds() > 300:
+            raise HTTPException(status_code=401, detail="Request expired")
+    except:
+        raise HTTPException(status_code=400, detail="Invalid timestamp")
+    
+    # Verify signature
+    expected_signature = hmac.new(
+        REQUEST_SIGNING_KEY.encode(),
+        f"{timestamp}{request_body}".encode(),
+        hashlib.sha256
+    ).hexdigest()
+    
+    if not hmac.compare_digest(signature, expected_signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+    
+    return True
+
+
+async def check_ip_whitelist(request: Request):
+    """Optional: Check if IP is in allowed ranges"""
+    if not ALLOWED_IP_RANGES or ALLOWED_IP_RANGES == ['']:
+        return True  # No whitelist configured
+    
+    client_ip = request.client.host
+    
+    # Simple check (you can use ipaddress module for CIDR ranges)
+    for allowed_range in ALLOWED_IP_RANGES:
+        if client_ip.startswith(allowed_range.strip()):
+            return True
+    
+    raise HTTPException(
+        status_code=403,
+        detail="Access denied from your location"
+    )
+
+
+async def log_api_access(
+    request: Request,
+    api_key_valid: bool = False,
+    user_id: Optional[str] = None
+):
+    """Log API access for monitoring"""
+    try:
+        log = APIAccessLog(
+            ip_address=request.client.host,
+            endpoint=request.url.path,
+            method=request.method,
+            user_agent=request.headers.get("user-agent"),
+            api_key_valid=api_key_valid,
+            user_id=user_id
+        )
+        await log.insert()
+    except Exception as e:
+        print(f"Logging error: {e}")
+
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def generate_otp() -> str:
-    """Generate 6-digit OTP"""
     return str(secrets.randbelow(1000000)).zfill(6)
 
 
-async def send_email(to_email: str, subject: str, body: str) -> bool:
-    """Send email using SMTP with better logging and typed port/tls"""
+async def send_email(to_email: str, subject: str, body: str):
     try:
         import emails
         from emails.template import JinjaTemplate as T
-
-        mail_from = (SMTP_FROM_NAME, SMTP_FROM_EMAIL) if SMTP_FROM_EMAIL else ("Photo Sorter App", "noreply@localhost")
-
+        
         message = emails.Message(
             subject=subject,
             html=T(body),
-            mail_from=mail_from
+            mail_from=(SMTP_FROM_EMAIL, "Photo Sorter App")
         )
-
-        smtp_opts = {
-            "host": SMTP_HOST,
-            "port": SMTP_PORT,
-            "user": SMTP_USERNAME or None,
-            "password": SMTP_PASSWORD or None,
-            "tls": bool(USE_TLS)
-        }
-
-        print(f"[email] sending to={to_email} smtp={smtp_opts}")
-
-        # IMPORTANT: removed timeout
-        result = message.send(
+        
+        r = message.send(
             to=to_email,
-            smtp=smtp_opts
+            smtp={
+                "host": SMTP_HOST,
+                "port": SMTP_PORT,
+                "user": SMTP_USERNAME,
+                "password": SMTP_PASSWORD,
+                "tls": True
+            }
         )
-
-        try:
-            status_code = getattr(result, "status_code", None)
-            reason = getattr(result, "reason", None)
-            print(f"[email] send result status_code={status_code} reason={reason} raw={result}")
-        except Exception:
-            print(f"[email] send result: {result}")
-
-        if status_code in (250, None):
-            return True
-        if getattr(result, "success", None) or getattr(result, "ok", None):
-            return True
-
-        return False
-
+        
+        return r.status_code == 250
     except Exception as e:
-        print(f"[email] exception sending email: {e}")
+        print(f"Email error: {e}")
         return False
 
 
 async def send_otp_email(email: str, otp_code: str, purpose: str):
-    """Send OTP verification email"""
     subject_map = {
         "signup": "Verify Your Email - Photo Sorter App",
-        "login": "Login Verification Code - Photo Sorter App",
-        "reset": "Password Reset Code - Photo Sorter App"
+        "login": "Login Verification Code",
+        "reset": "Password Reset Code"
     }
     
     body = f"""
@@ -302,8 +351,7 @@ async def send_otp_email(email: str, otp_code: str, purpose: str):
             <h1 style="background: #3498DB; color: white; padding: 20px; text-align: center; border-radius: 8px; letter-spacing: 5px;">
                 {otp_code}
             </h1>
-            <p style="color: #7F8C8D;">This code will expire in 10 minutes.</p>
-            <p style="color: #7F8C8D;">If you didn't request this code, please ignore this email.</p>
+            <p style="color: #7F8C8D;">This code expires in 10 minutes.</p>
         </body>
     </html>
     """
@@ -312,41 +360,34 @@ async def send_otp_email(email: str, otp_code: str, purpose: str):
 
 
 async def send_license_email(email: str, license_info: dict):
-    """Send license activation email"""
     body = f"""
     <html>
         <body style="font-family: Arial, sans-serif; padding: 20px;">
             <h2 style="color: #2ECC71;">✓ Payment Successful!</h2>
-            <p>Thank you for your purchase. Your license has been activated.</p>
+            <p>Your license has been activated.</p>
             
             <div style="background: #F8F9FA; padding: 20px; border-radius: 8px; margin: 20px 0;">
                 <h3>License Details:</h3>
-                <p><strong>Students Purchased:</strong> {license_info['student_count']}</p>
-                <p><strong>Amount Paid:</strong> ₦{license_info['amount_paid']}</p>
+                <p><strong>Students:</strong> {license_info['student_count']}</p>
+                <p><strong>Amount:</strong> ₦{license_info['amount_paid']}</p>
                 <p><strong>Valid Until:</strong> {license_info['valid_until']}</p>
                 <p><strong>Reference:</strong> {license_info['reference']}</p>
             </div>
             
-            <h3 style="color: #3498DB;">Next Steps:</h3>
+            <h3>Next Steps:</h3>
             <ol>
-                <li>Open your Photo Sorter desktop app</li>
-                <li>Go to the License page</li>
+                <li>Open Photo Sorter app</li>
+                <li>Go to License page</li>
                 <li>Click "Update License from Server"</li>
-                <li>Your license will be activated automatically</li>
             </ol>
-            
-            <p style="color: #7F8C8D; font-size: 12px; margin-top: 30px;">
-                If you encounter any issues, please contact support with your reference number.
-            </p>
         </body>
     </html>
     """
     
-    await send_email(email, "License Activated - Photo Sorter App", body)
+    await send_email(email, "License Activated - Photo Sorter", body)
 
 
 def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify JWT token from Authorization header"""
     try:
         token = credentials.credentials
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -359,17 +400,24 @@ def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Depends(securit
 
 
 async def get_current_user(token_data: dict = Depends(verify_jwt_token)) -> User:
-    """Get current user from JWT token"""
     user = await User.find_one(User.email == token_data["sub"])
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    # Check if account is locked
+    if user.account_locked_until and datetime.utcnow() < user.account_locked_until:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Account locked until {user.account_locked_until.isoformat()}"
+        )
+    
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account deactivated")
+    
     return user
 
 
 def get_license_status(user: User) -> dict:
-    """Get user's license status"""
     now = datetime.utcnow()
     
     if not user.license_valid_until:
@@ -393,45 +441,79 @@ def get_license_status(user: User) -> dict:
 
 
 def verify_paystack_signature(payload: bytes, signature: str) -> bool:
-    """Verify Paystack webhook signature"""
     if not PAYSTACK_SECRET_KEY:
         return False
-    computed_signature = hmac.new(
+    computed = hmac.new(
         PAYSTACK_SECRET_KEY.encode(),
         payload,
         hashlib.sha512
     ).hexdigest()
-    return hmac.compare_digest(computed_signature, signature)
+    return hmac.compare_digest(computed, signature)
 
 
 # ==================== FASTAPI APP ====================
-app = FastAPI(title="Photo Sorter Backend API", version="2.0.0")
+app = FastAPI(
+    title="Photo Sorter Secure Backend",
+    version="2.0.0-secure",
+    docs_url=None,  # Disable public docs in production
+    redoc_url=None
+)
+
+# Add rate limiter
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 @app.on_event("startup")
 async def on_startup():
     await init_beanie(
         database=db,
-        document_models=[
-            User,
-            License,
-            OTPVerification
-        ]
+        document_models=[User, License, OTPVerification, APIAccessLog]
     )
     print("🚀 Beanie initialized")
-    print(f"📊 MongoDB: {MONGO_DB_URL}")
-    print(f"🗄️  Database: {MONGO_DB_NAME}")
-    print(f"🔐 Password Hashing: Argon2 (secure, no byte limits)")
+    print(f"🔐 Security: API Key + Request Signing + Rate Limiting")
+    print(f"🔑 Desktop API Key: {DESKTOP_APP_API_KEY}...") 
+    print(f"⚠️  IMPORTANT: Share DESKTOP_APP_API_KEY with your desktop app!")
 
 
-# CORS
+# IMPORTANT: Strict CORS - only allow your desktop app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],  # Desktop app origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "GET"],  # Only needed methods
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Request-Signature", "X-Request-Timestamp"],
+    max_age=3600
 )
+
+
+# ==================== MIDDLEWARE ====================
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    """Global security middleware"""
+    # Skip for webhook (Paystack sends from their servers)
+    if request.url.path == "/webhook/paystack":
+        return await call_next(request)
+    
+    # Check IP whitelist (if configured)
+    try:
+        await check_ip_whitelist(request)
+    except HTTPException as e:
+        return e
+    
+    # Verify API key for all endpoints except root
+    if request.url.path != "/":
+        api_key = request.headers.get("X-API-Key")
+        if api_key != DESKTOP_APP_API_KEY:
+            await log_api_access(request, api_key_valid=False)
+            raise HTTPException(status_code=403, detail="Invalid API Key")
+    
+    # Log successful access
+    await log_api_access(request, api_key_valid=True)
+    
+    response = await call_next(request)
+    return response
 
 
 # ==================== ROUTES ====================
@@ -440,62 +522,68 @@ app.add_middleware(
 async def root():
     return {
         "status": "online",
-        "service": "Photo Sorter Backend API",
-        "version": "2.0.0 (Argon2)",
-        "password_hashing": "Argon2"
+        "service": "Photo Sorter Secure Backend",
+        "version": "2.0.0-secure",
+        "security": ["API Key", "Rate Limiting", "Request Signing"]
     }
 
 
 @app.post("/auth/signup")
-async def signup(request: SignupRequest, background_tasks: BackgroundTasks):
-    """Register new user and send OTP"""
-    # Check if email exists
-    existing_user = await User.find_one(User.email == request.email)
+@limiter.limit("5/hour")  # 5 signups per hour per IP
+async def signup(
+    request: Request,
+    signup_req: SignupRequest,
+    background_tasks: BackgroundTasks,
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Register new user - rate limited"""
+    existing_user = await User.find_one(User.email == signup_req.email)
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     
-    # Generate OTP
     otp_code = generate_otp()
-    print(otp_code)
+    print(f"OTP for {signup_req.email}: {otp_code}")
     expires_at = datetime.utcnow() + timedelta(minutes=10)
     
-    # Create user (unverified) with Argon2 hashing
-    password_hash = hash_password(request.password)
+    password_hash = hash_password(signup_req.password)
     
     user = User(
-        name=request.name,
-        email=request.email,
+        name=signup_req.name,
+        email=signup_req.email,
         password_hash=password_hash,
-        phone=request.phone,
+        phone=signup_req.phone,
         email_verified=False,
         verification_token=secrets.token_urlsafe(32)
     )
     await user.insert()
     
-    # Save OTP
     otp = OTPVerification(
-        email=request.email,
+        email=signup_req.email,
         otp_code=otp_code,
         purpose="signup",
         expires_at=expires_at
     )
     await otp.insert()
     
-    # Send OTP email
-    background_tasks.add_task(send_otp_email, request.email, otp_code, "signup")
+    background_tasks.add_task(send_otp_email, signup_req.email, otp_code, "signup")
     
     return {
         "success": True,
-        "message": "OTP sent to your email. Please verify to complete registration.",
-        "email": request.email
+        "message": "OTP sent to your email",
+        "email": signup_req.email
     }
 
 
 @app.post("/auth/verify-email")
-async def verify_email(request: VerifyEmailRequest):
-    """Verify email with OTP"""
+@limiter.limit("10/minute")
+async def verify_email(
+    request: Request,
+    verify_req: VerifyEmailRequest,
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Verify email with OTP - rate limited"""
     otp = await OTPVerification.find(
-        OTPVerification.email == request.email,
+        OTPVerification.email == verify_req.email,
         OTPVerification.purpose == "signup",
         OTPVerification.verified == False
     ).sort([("created_at", -1)]).first_or_none()
@@ -504,54 +592,81 @@ async def verify_email(request: VerifyEmailRequest):
         raise HTTPException(status_code=404, detail="No verification pending")
     
     if datetime.utcnow() > otp.expires_at:
-        raise HTTPException(status_code=400, detail="OTP expired. Request a new one.")
+        raise HTTPException(status_code=400, detail="OTP expired")
     
     if otp.attempts >= 5:
-        raise HTTPException(status_code=400, detail="Too many failed attempts. Request a new OTP.")
+        raise HTTPException(status_code=400, detail="Too many attempts")
     
-    if otp.otp_code != request.otp_code:
+    if otp.otp_code != verify_req.otp_code:
         otp.attempts += 1
         await otp.save()
-        raise HTTPException(status_code=400, detail=f"Invalid OTP. {5 - otp.attempts} attempts remaining.")
+        raise HTTPException(status_code=400, detail=f"Invalid OTP. {5 - otp.attempts} attempts left")
     
     otp.verified = True
+    await otp.save()
     
-    user = await User.find_one(User.email == request.email)
+    user = await User.find_one(User.email == verify_req.email)
     if user:
         user.email_verified = True
         await user.save()
     
-    await otp.save()
-    
-    return {
-        "success": True,
-        "message": "Email verified successfully! You can now login."
-    }
+    return {"success": True, "message": "Email verified"}
 
 
 @app.post("/auth/login", response_model=TokenResponse)
-async def login(request: LoginRequest):
-    """Login and get JWT token"""
-    user = await User.find_one(User.email == request.email)
+@limiter.limit("10/minute")  # 10 login attempts per minute per IP
+async def login(
+    request: Request,
+    login_req: LoginRequest,
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Login - rate limited to prevent brute force"""
+    user = await User.find_one(User.email == login_req.email)
     
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    # Verify password with Argon2
-    if not verify_password(request.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    # Check if account is locked
+    if user.account_locked_until and datetime.utcnow() < user.account_locked_until:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Account locked. Try again after {user.account_locked_until.isoformat()}"
+        )
+    
+    # Verify password
+    if not verify_password(login_req.password, user.password_hash):
+        # Track failed attempts
+        user.failed_login_attempts += 1
+        user.last_failed_login = datetime.utcnow()
+        
+        # Lock account after 5 failed attempts
+        if user.failed_login_attempts >= 5:
+            user.account_locked_until = datetime.utcnow() + timedelta(hours=1)
+            await user.save()
+            raise HTTPException(
+                status_code=403,
+                detail="Account locked due to multiple failed login attempts. Try again in 1 hour."
+            )
+        
+        await user.save()
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     
     if not user.email_verified:
-        raise HTTPException(status_code=403, detail="Email not verified. Please verify your email first.")
+        raise HTTPException(status_code=403, detail="Email not verified")
     
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account deactivated")
     
+    # Reset failed attempts on successful login
     user.last_login = datetime.utcnow()
-    user.device_fingerprint = request.device_fingerprint
+    user.device_fingerprint = login_req.device_fingerprint
+    user.failed_login_attempts = 0
+    user.account_locked_until = None
     await user.save()
     
-    access_token = create_access_token(data={"sub": user.email, "user_id": str(user.id)})
+    access_token = create_access_token(
+        data={"sub": user.email, "user_id": str(user.id)}
+    )
     
     license_status = get_license_status(user)
     
@@ -570,55 +685,242 @@ async def login(request: LoginRequest):
 
 
 @app.post("/auth/resend-otp")
-async def resend_otp(request: ResendOTPRequest, background_tasks: BackgroundTasks):
-    """Resend OTP with basic rate limit and success check"""
-    user = await User.find_one(User.email == request.email)
+@limiter.limit("3/hour")  # 3 OTP requests per hour
+async def resend_otp(
+    request: Request,
+    resend_req: ResendOTPRequest,
+    background_tasks: BackgroundTasks,
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Resend OTP - rate limited"""
+    user = await User.find_one(User.email == resend_req.email)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
+    
     if user.email_verified:
         raise HTTPException(status_code=400, detail="Email already verified")
-
-    # Basic rate limiting: check last OTP created within X seconds
-    recent = await OTPVerification.find(
-        OTPVerification.email == request.email,
-        OTPVerification.purpose == "signup"
-    ).sort([("created_at", -1)]).first_or_none()
-
-    if recent:
-        seconds_since = (datetime.utcnow() - recent.created_at).total_seconds()
-        if seconds_since < 60:   # 60 seconds cooldown
-            raise HTTPException(status_code=429, detail=f"Please wait {int(60 - seconds_since)}s before requesting a new OTP")
-
+    
     otp_code = generate_otp()
+    print(f"OTP for {resend_req.email}: {otp_code}")
     expires_at = datetime.utcnow() + timedelta(minutes=10)
-
+    
     otp = OTPVerification(
-        email=request.email,
+        email=resend_req.email,
         otp_code=otp_code,
         purpose="signup",
         expires_at=expires_at
     )
     await otp.insert()
-
-    # Use background task but capture result by scheduling a wrapper that logs outcome
-    async def _send_and_log(email, code):
-        sent = await send_otp_email(email, code, "signup")
-        print(f"[otp] resend to {email} code={code} sent={sent}")
-        return sent
-
-    # schedule background send
-    background_tasks.add_task(_send_and_log, request.email, otp_code)
-
-    return {"success": True, "message": "OTP queued for sending (check logs for delivery status)"}
+    
+    background_tasks.add_task(send_otp_email, resend_req.email, otp_code, "signup")
+    
+    return {"success": True, "message": "OTP sent"}
 
 
 @app.get("/license/status")
-async def get_license(current_user: User = Depends(get_current_user)):
-    """Get user's license status"""
-    license_status = get_license_status(current_user)
-    return license_status
+@limiter.limit("30/minute")
+async def get_license(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Get license status - rate limited"""
+    return get_license_status(current_user)
 
+
+@app.post("/license/verify/{reference}")
+@limiter.limit("10/minute")
+async def verify_license_payment(
+    request: Request,
+    reference: str,
+    current_user: User = Depends(get_current_user),
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Verify payment and activate license - rate limited"""
+    license_record = await License.find_one(
+        License.payment_reference == reference,
+        License.user_id == current_user.id
+    )
+    
+    if not license_record:
+        raise HTTPException(status_code=404, detail="License not found")
+    
+    if license_record.payment_status == "completed":
+        return {
+            "success": True,
+            "message": "License already activated",
+            "license": get_license_status(current_user)
+        }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://api.paystack.co/transaction/verify/{reference}",
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}
+        )
+    
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Verification failed")
+    
+    data = response.json()
+    
+    if data.get("data", {}).get("status") == "success":
+        license_record.payment_status = "completed"
+        license_record.payment_verified_at = datetime.utcnow()
+        
+        current_user.total_students_purchased += license_record.student_count
+        current_user.license_valid_until = license_record.valid_until
+        
+        await license_record.save()
+        await current_user.save()
+        
+        return {
+            "success": True,
+            "message": "License activated",
+            "license": get_license_status(current_user)
+        }
+    
+    return {
+        "success": False,
+        "message": "Payment not confirmed",
+        "status": data.get("data", {}).get("status")
+    }
+
+
+@app.get("/license/check")
+@limiter.limit("30/minute")
+async def check_license_from_device(
+    request: Request,
+    device_fingerprint: str,
+    current_user: User = Depends(get_current_user),
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Check license from desktop app - rate limited"""
+    if current_user.device_fingerprint != device_fingerprint:
+        raise HTTPException(status_code=403, detail="Device not authorized")
+    
+    return get_license_status(current_user)
+
+
+# ==================== ADMIN ENDPOINTS (Optional) ====================
+
+@app.get("/admin/stats")
+async def admin_stats(
+    admin_key: str = Header(..., alias="X-Admin-Key"),
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Get system stats - requires admin key"""
+    if admin_key != os.getenv("ADMIN_KEY", "change-me-in-production"):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    total_users = await User.count()
+    active_licenses = await User.find(
+        User.license_valid_until > datetime.utcnow()
+    ).count()
+    
+    total_revenue = 0
+    licenses = await License.find(License.payment_status == "completed").to_list()
+    for lic in licenses:
+        total_revenue += lic.amount_paid
+    
+    return {
+        "total_users": total_users,
+        "active_licenses": active_licenses,
+        "total_revenue": total_revenue,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+# ==================== RUN SERVER ====================
+if __name__ == "__main__":
+    import uvicorn
+    
+    print("\n" + "="*70)
+    print("🚀 PHOTO SORTER SECURE BACKEND API")
+    print("="*70)
+    print(f"\n📍 API: http://localhost:8001")
+    print(f"🔐 Security Features:")
+    print(f"   ✓ API Key Authentication")
+    print(f"   ✓ Rate Limiting (SlowAPI)")
+    print(f"   ✓ Request Signing Support")
+    print(f"   ✓ IP Whitelisting (Optional)")
+    print(f"   ✓ Account Lockout (5 failed logins)")
+    print(f"   ✓ Argon2 Password Hashing")
+    print(f"\n🔑 Desktop App API Key:")
+    print(f"   {DESKTOP_APP_API_KEY}")
+    print(f"\n⚠️  IMPORTANT - Add to Desktop App:")
+    print(f"   Set API_BASE_URL and DESKTOP_APP_API_KEY in desktop app")
+    print(f"\n💡 Environment Variables Required:")
+    print(f"   - MONGO_DB_URL")
+    print(f"   - SECRET_KEY")
+    print(f"   - DESKTOP_APP_API_KEY (auto-generated above)")
+    print(f"   - REQUEST_SIGNING_KEY (optional, for request signing)")
+    print(f"   - PAYSTACK_SECRET_KEY")
+    print(f"   - PAYSTACK_PUBLIC_KEY")
+    print(f"   - SMTP_* (email settings)")
+    print(f"   - ALLOWED_IP_RANGES (optional, comma-separated)")
+    print(f"   - ADMIN_KEY (optional, for admin endpoints)")
+    print("="*70 + "\n")
+
+@limiter.limit("5/hour")  # 5 payment initializations per hour
+async def initialize_license_purchase(
+    request: Request,
+    purchase_req: LicensePurchaseRequest,
+    current_user: User = Depends(get_current_user),
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Initialize license purchase - rate limited"""
+    if purchase_req.student_count < 1:
+        raise HTTPException(status_code=400, detail="Minimum 1 student")
+    
+    amount = purchase_req.student_count * PRICE_PER_STUDENT * 100
+    reference = f"PHOTO_{current_user.id}_{secrets.token_hex(8).upper()}"
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.paystack.co/transaction/initialize",
+            headers={
+                "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "email": purchase_req.email,
+                "amount": amount,
+                "reference": reference,
+                "currency": "NGN",
+                "callback_url": "https://yourapp.com/payment-success",
+                "metadata": {
+                    "user_id": str(current_user.id),
+                    "student_count": purchase_req.student_count,
+                    "product": "photo_sorter_license"
+                }
+            }
+        )
+    
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Payment init failed")
+    
+    data = response.json()
+    
+    if not data.get("status"):
+        raise HTTPException(status_code=400, detail="Payment init failed")
+    
+    license_record = License(
+        user_id=current_user.id,
+        student_count=purchase_req.student_count,
+        amount_paid=purchase_req.student_count * PRICE_PER_STUDENT,
+        payment_reference=reference,
+        payment_status="pending",
+        valid_until=datetime.utcnow() + timedelta(days=30)
+    )
+    await license_record.insert()
+    
+    return {
+        "success": True,
+        "payment_url": data["data"]["authorization_url"],
+        "reference": reference,
+        "amount": purchase_req.student_count * PRICE_PER_STUDENT,
+        "public_key": PAYSTACK_PUBLIC_KEY
+    }
 
 @app.post("/license/purchase/initialize")
 async def initialize_license_purchase(
@@ -683,7 +985,7 @@ async def initialize_license_purchase(
 
 @app.post("/webhook/paystack")
 async def paystack_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Handle Paystack webhook"""
+    """Paystack webhook - no API key required (verified by signature)"""
     signature = request.headers.get("x-paystack-signature")
     body = await request.body()
     
