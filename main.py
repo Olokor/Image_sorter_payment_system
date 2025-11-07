@@ -5,7 +5,7 @@ Multi-layer security: API Keys, Rate Limiting, Request Signing, IP Whitelisting
 pip install slowapi redis argon2-cffi
 """
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, Header
+from fastapi import FastAPI, Form, HTTPException, Depends, BackgroundTasks, Request, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -827,6 +827,163 @@ async def admin_stats(
         "active_licenses": active_licenses,
         "total_revenue": total_revenue,
         "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+
+@app.post("/auth/forgot-password")
+@limiter.limit("3/hour")
+async def forgot_password(
+    request: Request,
+    background_tasks: BackgroundTasks,   # moved up
+    email: EmailStr = Form(...),
+    _api_key: bool = Depends(verify_api_key)
+):
+    user = await User.find_one(User.email == email)
+
+    if not user:
+        return {
+            "success": True,
+            "message": "If the email exists, a password reset code has been sent."
+        }
+
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=400,
+            detail="Email not verified. Please verify your email first."
+        )
+
+    otp_code = generate_otp()
+    print(f"Password Reset OTP for {email}: {otp_code}")
+
+    expires_at = datetime.utcnow() + timedelta(minutes=10)
+
+    otp = OTPVerification(
+        email=email,
+        otp_code=otp_code,
+        purpose="password_reset",
+        expires_at=expires_at
+    )
+    await otp.insert()
+
+    background_tasks.add_task(send_password_reset_email, email, otp_code)
+
+    return {
+        "success": True,
+        "message": "If the email exists, a password reset code has been sent."
+    }
+
+@app.post("/auth/verify-reset-otp")
+@limiter.limit("10/minute")
+async def verify_reset_otp(
+    request: Request,
+    email: EmailStr = Form(...),
+    otp_code: str = Form(...),
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Verify password reset OTP (step 1 of password reset)"""
+    # Find most recent OTP for this email
+    otp = await OTPVerification.find(
+        OTPVerification.email == email,
+        OTPVerification.purpose == "password_reset",
+        OTPVerification.verified == False
+    ).sort([("created_at", -1)]).first_or_none()
+    
+    if not otp:
+        raise HTTPException(status_code=404, detail="No password reset request found")
+    
+    # Check expiry
+    if datetime.utcnow() > otp.expires_at:
+        raise HTTPException(status_code=400, detail="OTP expired. Request a new one.")
+    
+    # Check attempts
+    if otp.attempts >= 5:
+        raise HTTPException(
+            status_code=400,
+            detail="Too many failed attempts. Request a new OTP."
+        )
+    
+    # Verify OTP
+    if otp.otp_code != otp_code:
+        otp.attempts += 1
+        await otp.save()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid OTP. {5 - otp.attempts} attempts remaining."
+        )
+    
+    # Mark as verified
+    otp.verified = True
+    await otp.save()
+    
+    # Generate a temporary reset token (valid for 15 minutes)
+    reset_token = create_access_token(
+        data={"sub": email, "purpose": "password_reset"},
+        expires_delta=timedelta(minutes=15)
+    )
+    
+    return {
+        "success": True,
+        "message": "OTP verified. You can now reset your password.",
+        "reset_token": reset_token
+    }
+
+@app.post("/auth/reset-password")
+@limiter.limit("5/hour")
+async def reset_password(
+    request: Request,
+    reset_token: str = Form(...),
+    new_password: str = Form(...),
+    _api_key: bool = Depends(verify_api_key)
+):
+    """Reset password with verified token (step 2 of password reset)"""
+    # Validate password
+    if len(new_password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 6 characters"
+        )
+    
+    if len(new_password) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="Password too long (max 200 characters)"
+        )
+    
+    # Verify reset token
+    try:
+        payload = jwt.decode(reset_token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        purpose = payload.get("purpose")
+        
+        if not email or purpose != "password_reset":
+            raise HTTPException(status_code=401, detail="Invalid reset token")
+        
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired reset token")
+    
+    # Find user
+    user = await User.find_one(User.email == email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Update password
+    user.password_hash = hash_password(new_password)
+    
+    # Reset failed login attempts
+    user.failed_login_attempts = 0
+    user.account_locked_until = None
+    
+    await user.save()
+    
+    # Invalidate all OTPs for this user
+    await OTPVerification.find(
+        OTPVerification.email == email
+    ).update({"$set": {"verified": True}})
+    
+    return {
+        "success": True,
+        "message": "Password reset successful. You can now login with your new password."
     }
 
 
