@@ -358,6 +358,25 @@ async def send_otp_email(email: str, otp_code: str, purpose: str):
     
     await send_email(email, subject_map.get(purpose, "Verification Code"), body)
 
+async def send_password_reset_email(email: str, otp_code: str):
+    subject = "Password Reset Code - Photo Sorter App"
+    
+    body = f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2 style="color: #2C3E50;">Photo Sorter App</h2>
+            <p>You requested to reset your password.</p>
+            <p>Your password reset code is:</p>
+            <h1 style="background: #E67E22; color: white; padding: 20px; text-align: center; border-radius: 8px; letter-spacing: 5px;">
+                {otp_code}
+            </h1>
+            <p style="color: #7F8C8D;">This code expires in 10 minutes.</p>
+            <p style="color: #E74C3C; margin-top: 20px;">If you didn't request this, please ignore this email.</p>
+        </body>
+    </html>
+    """
+    
+    await send_email(email, subject, body)
 
 async def send_license_email(email: str, license_info: dict):
     body = f"""
@@ -459,6 +478,17 @@ app = FastAPI(
     redoc_url=None
 )
 
+# IMPORTANT: Strict CORS - only allow your desktop app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],  # Desktop app origins
+    allow_credentials=True,
+    allow_methods=["POST", "GET"],  # Only needed methods
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Request-Signature", "X-Request-Timestamp", "x-www-form-urlencoded"],
+    max_age=3600
+)
+
+
 # Add rate limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -476,42 +506,60 @@ async def on_startup():
     print(f"⚠️  IMPORTANT: Share DESKTOP_APP_API_KEY with your desktop app!")
 
 
-# IMPORTANT: Strict CORS - only allow your desktop app
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],  # Desktop app origins
-    allow_credentials=True,
-    allow_methods=["POST", "GET"],  # Only needed methods
-    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Request-Signature", "X-Request-Timestamp"],
-    max_age=3600
-)
 
 
 # ==================== MIDDLEWARE ====================
 
+# @app.middleware("http")
+# async def security_middleware(request: Request, call_next):
+#     """Global security middleware"""
+#     # Skip for webhook (Paystack sends from their servers)
+#     if request.url.path == "/webhook/paystack":
+#         return await call_next(request)
+    
+#     # Check IP whitelist (if configured)
+#     try:
+#         await check_ip_whitelist(request)
+#     except HTTPException as e:
+#         return e
+    
+#     # Verify API key for all endpoints except root
+#     if request.url.path != "/":
+#         api_key = request.headers.get("X-API-Key")
+#         if api_key != DESKTOP_APP_API_KEY:
+#             await log_api_access(request, api_key_valid=False)
+#             raise HTTPException(status_code=403, detail="Invalid API Key")
+    
+#     # Log successful access
+#     await log_api_access(request, api_key_valid=True)
+    
+#     response = await call_next(request)
+#     return response
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
-    """Global security middleware"""
+    # Allow OPTIONS requests through (CORS preflight)
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     # Skip for webhook (Paystack sends from their servers)
     if request.url.path == "/webhook/paystack":
         return await call_next(request)
-    
+
     # Check IP whitelist (if configured)
     try:
         await check_ip_whitelist(request)
     except HTTPException as e:
         return e
-    
+
     # Verify API key for all endpoints except root
     if request.url.path != "/":
         api_key = request.headers.get("X-API-Key")
         if api_key != DESKTOP_APP_API_KEY:
             await log_api_access(request, api_key_valid=False)
             raise HTTPException(status_code=403, detail="Invalid API Key")
-    
-    # Log successful access
+
     await log_api_access(request, api_key_valid=True)
-    
+
     response = await call_next(request)
     return response
 
@@ -844,7 +892,7 @@ async def forgot_password(
     if not user:
         return {
             "success": True,
-            "message": "If the email exists, a password reset code has been sent."
+            "message": "Email not registered."
         }
 
     if not user.email_verified:
